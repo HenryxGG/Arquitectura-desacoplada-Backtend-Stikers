@@ -55,3 +55,5 @@ Frontend → POST /stickers/{id}/upload-url → Lambda genera presigned URL
 Frontend → PUT <presigned-url> (directo a S3) → imagen guardada
 CloudFront → sirve la imagen automáticamente
 ```
+
+Nota: Este es mi primer backend en una arquitectura desacoplada. El proyecto continuará evolucionando con mejoras, optimizaciones y nuevas funcionalidades a medida que siga aprendiendo y aplicando buenas prácticas. 🚀
