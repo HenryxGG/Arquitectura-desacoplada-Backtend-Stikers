@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "cromos-backend-henry"
+resolve_s3 = true
+s3_prefix = "cromos-backend-henry"
+confirm_changeset = true
+parameter_overrides = "StageName=\"dev\" StackSuffix=\"shared\""
+image_repositories = []
+capabilities = "CAPABILITY_NAMED_IAM"
+
+[default.global.parameters]
+region = "us-east-1"

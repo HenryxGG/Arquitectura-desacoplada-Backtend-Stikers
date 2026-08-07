@@ -1,0 +1,696 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Backend serverless para Cromos - Fase 5 (Cuenta Compartida - Stack Independiente)
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Nombre del stage del API Gateway REST
+    AllowedValues: [dev, staging, prod]
+  
+  StackSuffix:
+    Type: String
+    Default: shared
+    Description: Sufijo único para diferenciar recursos en cuenta compartida
+    MinLength: 1
+    MaxLength: 20
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Timeout: 10
+    MemorySize: 128
+    CodeUri: .
+    Environment:
+      Variables:
+        SERVICE_NAME: cromos-backend-shared-edition
+        STAGE: !Ref StageName
+        LOG_LEVEL: info
+        APP_VERSION: 1.0.0
+        TABLA_CROMOS: !Ref TablaCromos
+        IMAGE_BUCKET: !Ref SharedStickerImagesBucket
+
+# ============================================================================
+# Resources: Roles IAM Nuevos, S3, CloudFront, API Gateway, Lambdas
+# ============================================================================
+
+Resources:
+# 1. El Bucket de S3 con el bloqueo configurado correctamente para CloudFront
+  SharedStickerImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "cromos-images-bucket-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: false     # Permitimos políticas personalizadas para OAC
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: false # Necesario para que CloudFront (OAC) pueda leer de forma segura
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ["*"]
+            AllowedMethods: ["PUT", "POST", "GET"]
+            AllowedOrigins: ["*"]
+            MaxAge: 3000
+
+  # 2. Control de Acceso de Origen (OAC) para CloudFront
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "OAC-Stickers-${AWS::StackName}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # 3. La Distribución de CloudFront (CDN)
+  StickersCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: "CDN para imagenes de cromos"
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: ["GET", "HEAD", "OPTIONS"]
+          CachedMethods: ["GET", "HEAD"]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt SharedStickerImagesBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig: {}
+
+  # 4. Única Política de Bucket para permitir lectura exclusiva desde CloudFront
+  SharedStickerImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SharedStickerImagesBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:GetObject'
+            Resource: !Sub '${SharedStickerImagesBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${StickersCloudFrontDistribution}'
+  # ============================================================================
+  # Base de Datos NoSQL - DynamoDB
+  # ============================================================================
+  TablaCromos:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "cromos-db-${StackSuffix}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      Tags:
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Stack
+          Value: !Ref StackSuffix
+
+  # ============================================================================
+  # Autenticación - Amazon Cognito (User Pool)
+  # ============================================================================
+  CromosUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "cromos-users-${StackSuffix}"
+      # Los usuarios se registrarán e iniciarán sesión con su email
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+
+  # El cliente que permitirá a tu app de React comunicarse con Cognito
+  CromosUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: cromos-react-client
+      UserPoolId: !Ref CromosUserPool
+      # GenerateSecret DEBE ser false porque React (al ser frontend) no puede guardar secretos de forma segura
+      GenerateSecret: false 
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # Política pública de lectura para S3 - BUCKET NUEVO
+  SharedStickerImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SharedStickerImagesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: 
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt SharedStickerImagesBucket.Arn
+              - !Sub "${SharedStickerImagesBucket.Arn}/*"
+
+  # ============================================================================
+  # Rol IAM Nuevo - CON NOMBRE ÚNICO
+  # ============================================================================
+  SharedLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cromos-backend-lambda-role-${StackSuffix}"
+      Description: Rol para Lambda con mínimo privilegio (cuenta compartida)
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Environment
+          Value: !Ref StageName
+        - Key: Stack
+          Value: !Ref StackSuffix
+      Policies:
+        # ====================================================================
+        # Política 1: CloudWatch Logs - NUEVA Y ESPECÍFICA
+        # ====================================================================
+        - PolicyName: !Sub "CloudWatchLogsPolicy-${StackSuffix}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CreateAndWriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cromos-backend-shared-*:*"
+        
+        # ====================================================================
+        # Política 2: S3 Read-Only - BUCKET NUEVO Y ESPECÍFICO
+        # ====================================================================
+        - PolicyName: !Sub "S3ReadOnlyPolicy-${StackSuffix}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ReadFromSharedBucket
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt SharedStickerImagesBucket.Arn
+                  - !Sub "${SharedStickerImagesBucket.Arn}/*"
+              - Sid: DenyWriteOperations
+                Effect: Deny
+                Action:
+                  - s3:DeleteObject
+                  - s3:PutBucketPolicy
+                  - s3:DeleteBucket
+                Resource:
+                  - !GetAtt SharedStickerImagesBucket.Arn
+                  - !Sub "${SharedStickerImagesBucket.Arn}/*"
+
+        # ====================================================================
+        # Política 3: DynamoDB Access
+        # ====================================================================
+        - PolicyName: !Sub "DynamoDBAccessPolicy-${StackSuffix}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBCRUD
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt TablaCromos.Arn
+
+  # ============================================================================
+  # CloudFront Distribution - NUEVA Y ÚNICA
+  # ============================================================================
+  SharedStickerImagesDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "CloudFront CDN para Cromos Media - ${StackSuffix} (${StageName})"
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        DefaultCacheBehavior:
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          TargetOriginId: SharedS3Origin
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          MinTTL: 0
+          Compress: true
+        Origins:
+          - DomainName: !GetAtt SharedStickerImagesBucket.DomainName
+            Id: SharedS3Origin
+            S3OriginConfig: {}
+      Tags:
+          - Key: Environment
+            Value: !Ref StageName
+          - Key: Stack
+            Value: !Ref StackSuffix
+
+  # ============================================================================
+  # API Gateway REST - NUEVA Y ÚNICA
+  # ============================================================================
+  SharedCromosRestApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "cromos-backend-shared-rest-api-${StackSuffix}"
+      StageName: !Ref StageName
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowOrigin: "'*'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      Tags:
+        Environment: !Ref StageName
+        Stack: !Ref StackSuffix
+
+  # ============================================================================
+  # Lambda Functions - NOMBRES NUEVOS Y ÚNICOS
+  # ============================================================================
+  SharedRootFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-root-${StackSuffix}"
+      Handler: src/handlers/root.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: root
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        RootGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /
+            Method: GET
+        RootOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /
+            Method: OPTIONS
+
+  SharedHealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-health-${StackSuffix}"
+      Handler: src/handlers/health.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: health
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        HealthGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /health
+            Method: GET
+        HealthOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /health
+            Method: OPTIONS
+
+  SharedCountriesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-countries-${StackSuffix}"
+      Handler: src/handlers/countries.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: countries
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        CountriesList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /countries
+            Method: GET
+        CountriesById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /countries/{id}
+            Method: GET
+        CountriesOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /countries
+            Method: OPTIONS
+        CountriesCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /countries
+            Method: POST
+        CountriesByIdOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /countries/{id}
+            Method: OPTIONS
+
+  SharedTeamsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-teams-${StackSuffix}"
+      Handler: src/handlers/teams.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: teams
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        TeamsList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /teams
+            Method: GET
+        TeamsById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /teams/{id}
+            Method: GET
+        TeamsOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /teams
+            Method: OPTIONS
+        TeamsCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /teams
+            Method: POST
+        TeamsByIdOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /teams/{id}
+            Method: OPTIONS
+
+  SharedPlayersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-players-${StackSuffix}"
+      Handler: src/handlers/players.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: players
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        PlayersList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /players
+            Method: GET
+        PlayersById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /players/{id}
+            Method: GET
+        PlayersCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /players
+            Method: POST
+        PlayersOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /players
+            Method: OPTIONS
+        PlayersByIdOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /players/{id}
+            Method: OPTIONS
+
+  SharedStickersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-stickers-${StackSuffix}"
+      Handler: src/handlers/stickers.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: stickers
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        StickersList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers
+            Method: GET
+        StickersCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers
+            Method: POST
+        StickersById:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}
+            Method: GET
+        StickersUpdate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}
+            Method: PUT
+        StickersDelete:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}
+            Method: DELETE
+        StickersOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers
+            Method: OPTIONS
+        StickerUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}/upload-url
+            Method: POST
+        StickerUploadUrlOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}/upload-url
+            Method: OPTIONS
+        StickersByIdOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/{id}
+            Method: OPTIONS
+
+  # ── Wizard: crea país + equipo + jugador + cromo en un solo paso ────────────
+  SharedStickersFullFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "cromos-backend-shared-stickers-full-${StackSuffix}"
+      Handler: src/handlers/stickers-full.lambdaHandler
+      Role: !GetAtt SharedLambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          DOMAIN_NAME: stickers-full
+          STACK_SUFFIX: !Ref StackSuffix
+          TABLA_CROMOS: !Ref TablaCromos
+      Events:
+        StickersFullCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/full
+            Method: POST
+        StickersFullOptions:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SharedCromosRestApi
+            Path: /stickers/full
+            Method: OPTIONS
+
+# ============================================================================
+# Outputs - TODOS LOS VALORES NUEVOS Y ÚNICOS
+# ============================================================================
+Outputs:
+  StackSuffix:
+    Description: Identificador único del stack en cuenta compartida
+    Value: !Ref StackSuffix
+    Export:
+      Name: !Sub "${AWS::StackName}-StackSuffix"
+
+  Environment:
+    Description: Environment del deployment
+    Value: !Ref StageName
+    Export:
+      Name: !Sub "${AWS::StackName}-Environment"
+
+  RestApiUrl:
+    Description: URL del API Gateway REST (NUEVA)
+    Value: !Sub "https://${SharedCromosRestApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: !Sub "${AWS::StackName}-RestApiUrl"
+
+  SharedLambdaExecutionRoleArn:
+    Description: ARN del nuevo rol IAM (con sufijo único)
+    Value: !GetAtt SharedLambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaRoleArn"
+
+  SharedLambdaExecutionRoleName:
+    Description: Nombre del nuevo rol IAM
+    Value: !Ref SharedLambdaExecutionRole
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaRoleName"
+
+  SharedS3BucketName:
+    Description: Nombre del nuevo bucket S3 (ÚNICO)
+    Value: !Ref SharedStickerImagesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Bucket"
+
+  SharedS3BucketDomain:
+    Description: Dominio del bucket S3 (acceso directo - NUEVO)
+    Value: !GetAtt SharedStickerImagesBucket.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Domain"
+
+  SharedCloudFrontDomain:
+    Description: Dominio de CloudFront (NUEVA distribución)
+    Value: !GetAtt SharedStickerImagesDistribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDomain"
+
+  SharedCloudFrontDistributionId:
+    Description: ID de la distribución CloudFront (NUEVA)
+    Value: !Ref SharedStickerImagesDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontId"
+
+  SharedS3DirectUrl:
+    Description: URL para acceder a imágenes vía S3 directo (NUEVA)
+    Value: !Sub "https://${SharedStickerImagesBucket.DomainName}/stickers/"
+    Export:
+      Name: !Sub "${AWS::StackName}-S3Url"
+
+  SharedCloudFrontUrl:
+    Description: URL para acceder a imágenes vía CloudFront (NUEVA)
+    Value: !Sub "https://${SharedStickerImagesDistribution.DomainName}/stickers/"
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontUrl"
+
+  Phase:
+    Description: Fase implementada
+    Value: "5 - S3 + CloudFront (Shared Account Edition)"
+    Export:
+      Name: !Sub "${AWS::StackName}-Phase"
+
+  IamConfiguration:
+    Description: Configuración IAM (Mínimo Privilegio con Deny explícito)
+    Value: !Sub |
+      Rol: cromos-backend-lambda-role-${StackSuffix}
+      S3 Acceso: GetObject, ListBucket
+      S3 Bloqueado: PutObject, DeleteObject, PutBucketPolicy
+      Logs: CreateLogGroup, CreateLogStream, PutLogEvents
+      Scope: Solo cromos-media-${StackSuffix}-* bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-IamConfig"
+
+  DeploymentInfo:
+    Description: Información del deployment en cuenta compartida
+    Value: !Sub |
+      Stack Name: ${AWS::StackName}
+      Stack Suffix: ${StackSuffix}
+      Region: ${AWS::Region}
+      Account: ${AWS::AccountId}
+      Stage: ${StageName}
+      Runtime: nodejs24.x
+      Status: Completamente independiente del stack original
+    Export:
+      Name: !Sub "${AWS::StackName}-DeploymentInfo"
+
+  UserPoolId:
+    Description: "ID del User Pool de Cognito"
+    Value: !Ref CromosUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: "Client ID de Cognito para la SPA"
+    Value: !Ref CromosUserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"

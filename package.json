@@ -1,0 +1,30 @@
+{
+  "name": "cromos-backend-cloud-demo",
+  "version": "1.0.0",
+  "description": "Backend serverless introductorio para Cromos del Mundial Cloud Edition",
+  "main": "src/handlers/root.js",
+  "scripts": {
+    "start:local": "node src/local-server.js",
+    "smoke": "node scripts/smoke.js",
+    "build": "sam build",
+    "deploy": "sam deploy"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "latest",
+    "@aws-sdk/client-s3": "latest",
+    "@aws-sdk/lib-dynamodb": "latest",
+    "@aws-sdk/s3-request-presigner": "3.1093.0"
+  },
+  "keywords": [
+    "aws",
+    "sam",
+    "lambda",
+    "api-gateway",
+    "serverless"
+  ],
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=24"
+  }
+}
