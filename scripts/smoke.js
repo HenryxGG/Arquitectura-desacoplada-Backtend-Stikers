@@ -1,6 +1,6 @@
 const { buildEvent, resolveHandler } = require("../src/local-router");
 
-process.env.SERVICE_NAME = process.env.SERVICE_NAME || "cromos-backend-cloud-demo";
+process.env.SERVICE_NAME = process.env.SERVICE_NAME || "cromos-backend";
 process.env.STAGE = process.env.STAGE || "dev";
 process.env.LOG_LEVEL = process.env.LOG_LEVEL || "info";
 process.env.APP_VERSION = process.env.APP_VERSION || "1.0.0";

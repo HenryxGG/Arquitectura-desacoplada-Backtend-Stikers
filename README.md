@@ -1,11 +1,11 @@
-# Backend — Cromos del Mundial Cloud Edition
+git commit -m "first commit"# Backend — Cromos del Mundial
 
 Backend serverless para la aplicación de colección de cromos del Mundial. Construido con AWS SAM, Node.js 24.x, Lambda, API Gateway y DynamoDB.
 
 ## Estructura del proyecto
 
 ```
-cromos-backend-cloud-demo/
+CROMOS-BACKEND/
 ├── template.yaml              # Infraestructura como código (SAM/CloudFormation)
 ├── samconfig.toml             # Configuración del deploy
 ├── src/

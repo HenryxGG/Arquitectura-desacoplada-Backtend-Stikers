@@ -1,7 +1,7 @@
 {
-  "name": "cromos-backend-cloud-demo",
+  "name": "cromos-backend",
   "version": "1.0.0",
-  "description": "Backend serverless introductorio para Cromos del Mundial Cloud Edition",
+  "description": "Backend serverless introductorio para Cromos del Mundial",
   "main": "src/handlers/root.js",
   "scripts": {
     "start:local": "node src/local-server.js",
