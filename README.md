@@ -1,4 +1,4 @@
-git commit -m "first commit"# Backend — Cromos del Mundial
+# Backend — Cromos del Mundial
 
 Backend serverless para la aplicación de colección de cromos del Mundial. Construido con AWS SAM, Node.js 24.x, Lambda, API Gateway y DynamoDB.
 
